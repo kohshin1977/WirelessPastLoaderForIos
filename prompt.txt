@@ -1,0 +1,107 @@
+●仕様
+1) 基本要件
+
+経路: 端末A（カメラ送信） → 端末B（表示受信）
+
+通信: UDP 単方向（NAT越えなし、同一LAN/同一L2推奨）
+
+ポート: 5004/udp（映像）
+
+コーデック: H.265(HEVC) 固定
+
+コンテナ: RTP（RFC 7798 準拠）
+
+逆方向通信: なし（RTCP/NACK/IDR要求なし）
+
+2) ネットワーク・パケット化
+
+MTU想定: 1500B（Wi-Fi）。アプリ側のRTPペイロード上限は**≈1200B**に制限
+
+RTP基本ヘッダ（12B, 共通）
+
+Version=2, P=0, X=0, CC=0
+
+Marker(M): 各フレームの最後のRTPパケットで1
+
+Payload Type(PT): 動的割当（例: 98 をH.265に使用）
+
+Sequence Number: 16bit、パケット毎に+1
+
+Timestamp: 90kHz クロック（30fpsなら1フレーム=3000tick）
+
+SSRC: 送信側でランダム生成（セッション中固定）
+
+3) H.265 over RTP（RFC 7798）ルール
+
+単一NALモード: 小さいNALは「1パケット=1NAL」
+
+フラグメンテーション（FU, nal_unit_type=49）: 大きいNALはFUで分割
+
+Start/Endフラグで断片境界を明示
+
+1パケットのRTPペイロード ≈1200B 以下
+
+VPS/SPS/PPSの送出方針
+
+接続直後に必ず送出
+
+各IDRの直前（または直後）にも送出
+
+逆方向なしのため定期（例:1–2秒おき）再送を推奨
+
+フレーム境界: フレーム最後のパケットでMarker=1に統一
+
+4) 送信（端末A）エンコード・レート
+
+コーデック: H.265 Main / Level 4.0 目安（端末性能に応じて）
+
+初期プロファイル例（屋内Wi-Fi）
+
+720p @ 30fps, 2.5–4.0 Mbps, GOP=1–2秒, Bフレーム無し（低遅延）
+
+IDR周期: 短め（1–2秒）
+
+※ 逆方向なし＝フリーズ復帰はIDR待ちになるため
+
+出力形式: Annex-B/AVCC いずれでも可（RTP化時にNAL境界を正しく扱う）
+
+5) 受信（端末B）処理フロー
+
+RTP受信 → Seqで欠落検知、Timestampでフレームを束ねる
+
+FU再結合 → 断片を結合し元のNALに復元
+
+フレーム化 → Timestamp単位で完成したNALをまとめる
+
+ジッタ吸収: **最小（0–100ms程度）**でリアルタイム優先
+
+デコード→描画: H.265ハードウェアデコード、VSync同期
+
+欠落・破損フレーム: 破棄し次フレームへ（画面保持で視覚的安定）
+
+端末Aのプログラムを作成してください。エンコードはVideoToolBoxを使用してGPUを使用してください。
+
+-------------------------------------------------------------------------------
+エラーが発生しました。
+/Users/tokunagaisaoshin/AndroidStudioProjects/WirelessPastLoaderForIos/WirelessPastLoaderForIos/WirelessPastLoaderForIos/ContentView.swift:12:6 Generic struct 'StateObject' requires that 'CameraStreamManager' conform to 'ObservableObject'
+
+-------------------------------------------------------------------------------
+<0x13e261040> Gesture: System gesture gate timed out.
+App is being debugged, do not track this hang
+Hang detected: 1.51s (debugger attached, not reporting)
+Streaming started to 192.168.0.68:5004
+UDP connection ready
+Unable to open mach-O at path: /Library/Caches/com.apple.xbs/Binaries/RenderBox/install/Root/System/Library/PrivateFrameworks/RenderBox.framework/default.metallib  Error:2
+App is being debugged, do not track this hang
+Hang detected: 0.39s (debugger attached, not reporting)
+Camera capture started
+Encoding frame #0
+Frame 0 sent to encoder
+Sending batch of 3 packets
+Swift/arm64-apple-ios.swiftinterface:27629: Fatal error: self must be a properly aligned pointer for types Pointee and T
+Sent packet: 36 bytes
+Sent packet: 52 bytes
+Sent packet: 19 bytes
+
+     let nalLength = Int(data.advanced(by: offset).withMemoryRebound(to: UInt32.self, capacity: 1) {   Thread 12: Fatal error: self must be a properly aligned pointer for types Pointee and T
+     
