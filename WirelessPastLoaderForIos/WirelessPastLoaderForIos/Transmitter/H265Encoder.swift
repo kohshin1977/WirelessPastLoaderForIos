@@ -26,6 +26,10 @@ class H265Encoder {
     private var frameCount: Int64 = 0
     private var lastParameterSetTime: Date = Date()
     
+    // File saving properties
+    private var fileHandle: FileHandle?
+    private var isRecording = false
+    
     init() {}
     
     func configure(width: Int32, height: Int32, fps: Int32, bitrate: Int32) {
@@ -39,48 +43,108 @@ class H265Encoder {
     }
     
     private func setupCompressionSession() {
+        // ハードウェアエンコーダー要求（任意）
+        let encoderSpec: [CFString: Any] = [
+            kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: true
+        ]
+
         let status = VTCompressionSessionCreate(
             allocator: kCFAllocatorDefault,
             width: width,
             height: height,
             codecType: kCMVideoCodecType_HEVC,
-            encoderSpecification: nil,
+            encoderSpecification: encoderSpec as CFDictionary,
             imageBufferAttributes: nil,
             compressedDataAllocator: nil,
             outputCallback: compressionOutputCallback,
             refcon: Unmanaged.passUnretained(self).toOpaque(),
             compressionSessionOut: &compressionSession
         )
-        
+
         guard status == noErr, let session = compressionSession else {
             print("Failed to create compression session: \(status)")
             return
         }
-        
+
+        // リアルタイム（必要なら）
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+
+        // HEVC Main（10bitでなければ Main のままでOK）
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_HEVC_Main_AutoLevel)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
-        
-        // Increase bitrate for better quality
-        let actualBitrate = max(bitrate, 8_000_000) // Minimum 8 Mbps for 720p
-        let bitrateLimits = [actualBitrate * 150 / 100, actualBitrate] as CFArray
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: bitrateLimits)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: actualBitrate as CFNumber)
-        
-        // Quality settings for reduced block noise
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_Quality, value: 0.9 as CFNumber)
-        
-        // Additional quality improvements
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MoreFramesBeforeStart, value: 0 as CFNumber)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MoreFramesAfterEnd, value: 0 as CFNumber)
-        
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: fps as CFNumber)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: keyFrameInterval as CFNumber)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: 2.0 as CFNumber)
-        
-        print("H265Encoder configured: \(width)x\(height) @ \(fps)fps, bitrate: \(actualBitrate)")
-        
+
+        // ★ 画質優先：Bフレーム有効化
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanTrue)
+
+        // ★ ビットレート設定：bps（ビット/秒）
+        let targetBitrateBps = NSNumber(value: bitrate) // 例: 3_000_000
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: targetBitrateBps)
+
+        // ★ 瞬間上限：bytes/s と 秒数
+        let bytesPerSec = NSNumber(value: Int(bitrate) / 8)
+        let oneSecond   = NSNumber(value: 1)
+        let dataRateLimits: [NSNumber] = [bytesPerSec, oneSecond]
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: dataRateLimits as CFArray)
+
+        // Qualityは外す（AverageBitRate優先時は意味が薄い/無視されがち）
+        // VTSessionSetProperty(session, key: kVTCompressionPropertyKey_Quality, value: NSNumber(value: 1.0))
+
+        // 期待フレームレート
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: NSNumber(value: fps))
+
+        // キーフレーム間隔は3〜4秒推奨（片方だけ設定）
+        let gopSeconds: Double = 4.0
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: NSNumber(value: gopSeconds))
+        // もしくはフレーム数で指定するなら：
+        // VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: NSNumber(value: fps * 4))
+
+        print("H265Encoder configured: \(width)x\(height) @ \(fps)fps, bitrate: \(bitrate) bps")
         VTCompressionSessionPrepareToEncodeFrames(session)
+    }
+    
+    func startRecording() {
+        stopRecording() // Stop any existing recording
+        
+        let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "yyyyMMdd_HHmmss"
+        let fileName = "stream_\(dateFormatter.string(from: Date())).h265"
+        let fileURL = documentsPath.appendingPathComponent(fileName)
+        
+        do {
+            // Create file if it doesn't exist
+            if !FileManager.default.fileExists(atPath: fileURL.path) {
+                FileManager.default.createFile(atPath: fileURL.path, contents: nil, attributes: nil)
+            }
+            
+            fileHandle = try FileHandle(forWritingTo: fileURL)
+            fileHandle?.seekToEndOfFile()
+            isRecording = true
+            
+            print("Started recording H.265 stream to: \(fileURL.path)")
+        } catch {
+            print("Failed to create file handle: \(error)")
+            fileHandle = nil
+            isRecording = false
+        }
+    }
+    
+    func stopRecording() {
+        guard isRecording else { return }
+        
+        fileHandle?.closeFile()
+        fileHandle = nil
+        isRecording = false
+        print("Stopped recording H.265 stream")
+    }
+    
+    private func writeToFile(_ data: Data) {
+        guard isRecording, let fileHandle = fileHandle else { return }
+        
+        do {
+            try fileHandle.write(contentsOf: data)
+        } catch {
+            print("Failed to write to file: \(error)")
+        }
     }
     
     func encode(sampleBuffer: CMSampleBuffer) {
@@ -170,6 +234,11 @@ class H265Encoder {
                     nalUnits.append(sps)
                     nalUnits.append(pps)
                     delegate?.encoder(self, didOutputParameterSets: vps, sps: sps, pps: pps)
+                    
+                    // Write parameter sets to file
+                    writeToFile(vps)
+                    writeToFile(sps)
+                    writeToFile(pps)
                 }
             }
         }
@@ -196,6 +265,10 @@ class H265Encoder {
             nalUnit.append(Data(bytes: data.advanced(by: offset), count: nalLengthInt))
             
             nalUnits.append(nalUnit)
+            
+            // Write NAL unit to file
+            writeToFile(nalUnit)
+            
             offset += nalLengthInt
         }
         
@@ -275,6 +348,8 @@ class H265Encoder {
     }
     
     func stop() {
+        stopRecording()
+        
         if let session = compressionSession {
             VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
             VTCompressionSessionInvalidate(session)

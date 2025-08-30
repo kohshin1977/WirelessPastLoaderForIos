@@ -79,7 +79,8 @@ class CameraStreamManager: NSObject, ObservableObject {
     func startStreaming(host: String, port: UInt16 = 5004) {
         guard !isStreaming else { return }
         
-        encoder.configure(width: 720, height: 1280, fps: Int32(frameRate), bitrate: 12_000_000)
+        encoder.configure(width: 720, height: 1280, fps: Int32(frameRate), bitrate: 4_000_000)
+        encoder.startRecording() // Start saving H.265 stream to file
         
         udpSender.connect(host: host, port: port)
         
