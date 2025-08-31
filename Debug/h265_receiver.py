@@ -52,8 +52,9 @@ class RTPPacket:
 
 class H265RTPDepacketizer:
     def __init__(self):
+        # key: (ssrc, timestamp, start_seq)
         self.fragments = {}
-        self.complete_nalus = []
+        self.fragment_timeout = 0.5  # 500ms timeout for fragments
         
     def process_packet(self, packet):
         if len(packet.payload) < 2:
@@ -89,18 +90,46 @@ class H265RTPDepacketizer:
         nal_header = (nal_header & 0x81FF) | (fu_type << 9)
         
         if start_bit:
-            # Start of fragmented NAL unit
-            self.fragments[packet.timestamp] = struct.pack('!H', nal_header) + packet.payload[3:]
-        elif packet.timestamp in self.fragments:
-            # Continuation of fragmented NAL unit
-            self.fragments[packet.timestamp] += packet.payload[3:]
-            
-            if end_bit:
-                # End of fragmented NAL unit
-                nal_data = self.fragments.pop(packet.timestamp)
-                return b'\x00\x00\x00\x01' + nal_data
+            # Start of fragmented NAL unit - use composite key
+            key = (packet.ssrc, packet.timestamp, packet.sequence)
+            self.fragments[key] = {
+                'data': struct.pack('!H', nal_header) + packet.payload[3:],
+                'last_seq': packet.sequence,
+                'timestamp': time.time()
+            }
+            return None
+        
+        # Find matching fragment for continuation/end
+        candidates = [(k, v) for k, v in self.fragments.items()
+                      if k[0] == packet.ssrc and k[1] == packet.timestamp]
+        
+        if not candidates:
+            return None
+        
+        # Get the fragment with closest sequence number
+        key, state = min(candidates, key=lambda kv: abs(packet.sequence - kv[1]['last_seq'] - 1))
+        
+        state['data'] += packet.payload[3:]
+        state['last_seq'] = packet.sequence
+        state['timestamp'] = time.time()
+        
+        if end_bit:
+            # End of fragmented NAL unit
+            nal_data = state['data']
+            del self.fragments[key]
+            return b'\x00\x00\x00\x01' + nal_data
         
         return None
+    
+    def cleanup_old_fragments(self):
+        """Remove fragments that have timed out"""
+        current_time = time.time()
+        keys_to_delete = [
+            k for k, v in self.fragments.items()
+            if current_time - v['timestamp'] > self.fragment_timeout
+        ]
+        for key in keys_to_delete:
+            del self.fragments[key]
     
     def handle_ap(self, packet):
         # Aggregation packet - contains multiple NAL units
@@ -126,16 +155,14 @@ class H265RTPDepacketizer:
 class H265Decoder:
     def __init__(self):
         self.codec = av.CodecContext.create('hevc', 'r')
-        self.codec.extradata = None
-        self.buffer = BytesIO()
         self.frame_buffer = b''
         self.sps_received = False
         self.pps_received = False
         self.vps_received = False
         
-    def decode_nal_unit(self, nal_data):
+    def decode_nal_unit(self, nal_data, marker=False):
         if not nal_data:
-            return None
+            return []
         
         # Accumulate NAL units
         self.frame_buffer += nal_data
@@ -151,39 +178,22 @@ class H265Decoder:
                 self.sps_received = True
             elif nal_type == 34:
                 self.pps_received = True
-            
-            # Try to decode if we have parameter sets and it's a frame boundary
-            if self.vps_received and self.sps_received and self.pps_received:
-                if nal_type in [19, 20, 21]:  # IDR or CRA frames (potential frame boundaries)
-                    return self.decode_frame()
         
-        return None
-    
-    def decode_frame(self):
-        if not self.frame_buffer:
-            return None
-        
-        try:
-            # Create packet from buffer
-            packet = av.Packet(self.frame_buffer)
-            
-            # Decode frames
-            frames = []
-            for frame in self.codec.decode(packet):
-                # Convert to numpy array
-                img = frame.to_ndarray(format='bgr24')
-                frames.append(img)
-            
-            # Clear buffer after successful decode
-            if frames:
+        frames = []
+        # Decode when marker indicates access unit boundary
+        if marker and self.frame_buffer:
+            try:
+                packet = av.Packet(self.frame_buffer)
+                for frame in self.codec.decode(packet):
+                    frames.append(frame.to_ndarray(format='bgr24'))
+            except Exception as e:
+                print(f"Decode error: {e}")
+            finally:
+                # Clear buffer regardless of success to prevent accumulation
                 self.frame_buffer = b''
-            
-            return frames[0] if frames else None
-            
-        except Exception as e:
-            print(f"Decode error: {e}")
-            # Don't clear buffer on error - might need more data
-            return None
+        
+        return frames
+    
 
 class H265StreamReceiver:
     def __init__(self, port=5004):
@@ -191,6 +201,7 @@ class H265StreamReceiver:
         self.socket = None
         self.running = False
         self.packet_queue = queue.Queue(maxsize=1000)
+        self.frame_queue = queue.Queue(maxsize=30)  # Queue for decoded frames
         self.depacketizer = H265RTPDepacketizer()
         self.decoder = H265Decoder()
         self.stats_lock = threading.Lock()
@@ -201,11 +212,14 @@ class H265StreamReceiver:
             'last_sequence': -1,
             'lost_packets': 0
         }
+        self.last_cleanup_time = time.time()
         
     def start(self):
         # Create UDP socket
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # Increase receive buffer for high bitrate streams
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4*1024*1024)
         self.socket.bind(('0.0.0.0', self.port))
         self.socket.settimeout(0.1)
         
@@ -240,14 +254,18 @@ class H265StreamReceiver:
                 try:
                     packet = RTPPacket(data)
                     
-                    # Check for packet loss
+                    # Check for packet loss (more tolerant of reordering)
                     if self.stats['last_sequence'] != -1:
                         expected = (self.stats['last_sequence'] + 1) & 0xFFFF
                         if packet.sequence != expected:
-                            lost = (packet.sequence - expected) & 0xFFFF
-                            if lost < 1000:  # Reasonable threshold
+                            # Calculate difference accounting for wraparound
+                            diff = (packet.sequence - expected) & 0xFFFF
+                            # Only count as loss if significantly ahead (not reordering)
+                            if diff > 0 and diff < 100:  # Forward jump within reasonable range
                                 with self.stats_lock:
-                                    self.stats['lost_packets'] += lost
+                                    self.stats['lost_packets'] += diff
+                            elif diff > 0xFFF0:  # Small backward jump - likely reordering
+                                pass  # Don't count as loss
                     
                     with self.stats_lock:
                         self.stats['last_sequence'] = packet.sequence
@@ -269,19 +287,27 @@ class H265StreamReceiver:
             try:
                 packet = self.packet_queue.get(timeout=0.1)
                 
+                # Cleanup old fragments periodically
+                current_time = time.time()
+                if current_time - self.last_cleanup_time > 0.5:
+                    self.depacketizer.cleanup_old_fragments()
+                    self.last_cleanup_time = current_time
+                
                 # Depacketize RTP to NAL units
                 nal_data = self.depacketizer.process_packet(packet)
                 
                 if nal_data:
-                    # Try to decode
-                    frame = self.decoder.decode_nal_unit(nal_data)
+                    # Try to decode with marker bit
+                    frames = self.decoder.decode_nal_unit(nal_data, marker=packet.marker)
                     
-                    if frame is not None:
+                    # Handle all returned frames
+                    for frame in frames:
                         with self.stats_lock:
                             self.stats['frames_decoded'] += 1
                         
-                        # Display frame
-                        cv2.imshow('H.265 Stream', frame)
+                        # Queue frame for display in main thread
+                        if not self.frame_queue.full():
+                            self.frame_queue.put(frame)
                         
             except queue.Empty:
                 continue
@@ -293,6 +319,13 @@ class H265StreamReceiver:
         last_stats_time = time.time()
         
         while self.running:
+            # Display frames from queue (main thread)
+            try:
+                frame = self.frame_queue.get_nowait()
+                cv2.imshow('H.265 Stream', frame)
+            except queue.Empty:
+                pass
+            
             key = cv2.waitKey(1) & 0xFF
             
             if key == ord('q'):
